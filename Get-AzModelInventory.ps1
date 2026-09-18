@@ -4,11 +4,13 @@
 
 .DESCRIPTION
     Scans all enabled Azure subscriptions accessible to the logged-in account for:
+      - Microsoft Foundry model deployments from all catalog publishers
       - Azure OpenAI (Cognitive Services) model deployments
       - Azure Machine Learning online endpoint model deployments
 
-    Enriches Azure OpenAI deployments with lifecycle status and retirement dates from
-    the Azure OpenAI Models API, then highlights each deployment by retirement risk:
+    Enriches Microsoft Foundry and Azure OpenAI deployments with lifecycle status and
+    retirement dates from the Cognitive Services Models API, then highlights each
+    deployment by retirement risk:
 
       Color    Risk      Meaning
       ──────   ────────  ────────────────────────────────────────────
@@ -56,46 +58,79 @@ $ErrorActionPreference = 'Continue'
 
 # ── Helper functions ───────────────────────────────────────────────────────────
 
-function Invoke-AzRestJson([string]$Url) {
+function Set-AzSubscriptionContext([string]$SubscriptionId) {
+    if ($script:currentSubscriptionId -eq $SubscriptionId) { return $true }
+    az account set --subscription $SubscriptionId --only-show-errors 2>$null
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not switch Azure CLI context to subscription '$SubscriptionId'."
+        return $false
+    }
+    $script:currentSubscriptionId = $SubscriptionId
+    return $true
+}
+
+function Invoke-AzRestJson([string]$Url, [string]$SubscriptionId) {
     # Calls the Azure ARM REST API via the CLI and returns a parsed object.
+    if (-not (Set-AzSubscriptionContext -SubscriptionId $SubscriptionId)) { return $null }
     $raw = az rest --method get --url $Url --only-show-errors 2>$null
     if (-not $raw) { return $null }
     try { return ($raw | ConvertFrom-Json) } catch { return $null }
 }
 
 function Invoke-GraphQuery([string]$Query, [string[]]$Subscriptions) {
-    # Executes a Resource Graph query with automatic pagination.
+    # Resource Graph only accepts subscriptions from the Azure CLI's current tenant.
     $results   = [System.Collections.Generic.List[object]]::new()
-    $skipToken = $null
-    do {
-        $page = if ($skipToken) {
-            az graph query -q $Query -s $Subscriptions --first 1000 `
-                --skip-token $skipToken -o json --only-show-errors 2>$null | ConvertFrom-Json
-        } else {
-            az graph query -q $Query -s $Subscriptions --first 1000 `
-                -o json --only-show-errors 2>$null | ConvertFrom-Json
-        }
-        if ($page -and $page.data) { $results.AddRange([object[]]$page.data) }
-        $skipToken = if ($page) { $page.skip_token } else { $null }
-    } while ($skipToken)
+    $accounts  = az account list -o json --only-show-errors 2>$null | ConvertFrom-Json
+    $requested = $accounts | Where-Object { $_.state -eq 'Enabled' -and $_.id -in $Subscriptions }
+
+    foreach ($tenantGroup in ($requested | Group-Object tenantId)) {
+        $tenantSubscriptions = [string[]]$tenantGroup.Group.id
+        if (-not (Set-AzSubscriptionContext -SubscriptionId $tenantSubscriptions[0])) { continue }
+
+        $skipToken = $null
+        do {
+            $page = if ($skipToken) {
+                az graph query -q $Query -s $tenantSubscriptions --first 1000 `
+                    --skip-token $skipToken -o json --only-show-errors 2>$null | ConvertFrom-Json
+            } else {
+                az graph query -q $Query -s $tenantSubscriptions --first 1000 `
+                    -o json --only-show-errors 2>$null | ConvertFrom-Json
+            }
+            if ($page -and $page.data) { $results.AddRange([object[]]$page.data) }
+            $skipToken = if ($page) { $page.skip_token } else { $null }
+        } while ($skipToken)
+    }
     return $results
 }
 
-function Get-ModelLifecycleMap([string]$AccountId) {
+function Get-ModelLifecycleMap([string]$AccountId, [string]$SubscriptionId) {
     # Queries the Azure OpenAI Models API for an account and returns a hashtable
-    # keyed by "modelName::version" with LifecycleStatus and RetirementDate.
+    # keyed by "publisher::modelName::version" with lifecycle and inference retirement data.
     $url  = "https://management.azure.com$($AccountId)/models?api-version=2024-10-01"
-    $resp = Invoke-AzRestJson -Url $url
+    $resp = Invoke-AzRestJson -Url $url -SubscriptionId $SubscriptionId
     $map  = @{}
+    $map['__LookupSucceeded'] = ($null -ne $resp)
     if ($resp -and $resp.value) {
         foreach ($entry in $resp.value) {
             $m = if ($entry.PSObject.Properties['model']) { $entry.model } else { $entry }
             if (-not $m -or -not $m.name) { continue }
             $retireDate = $null
-            if ($m.PSObject.Properties['deprecationDate'] -and $m.deprecationDate) {
+            if ($m.PSObject.Properties['deprecation'] -and $m.deprecation.inference) {
+                try { $retireDate = [datetime]$m.deprecation.inference } catch {}
+            } elseif ($m.PSObject.Properties['deprecationDate'] -and $m.deprecationDate) {
                 try { $retireDate = [datetime]$m.deprecationDate } catch {}
+            } elseif ($m.PSObject.Properties['skus'] -and $m.skus) {
+                $skuRetirement = $m.skus |
+                    Where-Object deprecationDate |
+                    ForEach-Object {
+                        try { [datetime]$_.deprecationDate } catch {}
+                    } |
+                    Sort-Object |
+                    Select-Object -First 1
+                if ($skuRetirement) { $retireDate = $skuRetirement }
             }
-            $key      = "$($m.name)::$($m.version)"
+            $publisher = if ($m.PSObject.Properties['format'] -and $m.format) { $m.format } else { 'Unknown' }
+            $key       = "$publisher::$($m.name)::$($m.version)"
             $map[$key] = @{
                 LifecycleStatus = if ($m.lifecycleStatus) { $m.lifecycleStatus } else { 'Unknown' }
                 RetirementDate  = $retireDate
@@ -111,6 +146,7 @@ function Get-RetirementRisk {
         $RetirementDate
     )
     if ($LifecycleStatus -eq 'Retired') { return 'Retired' }
+    if ($LifecycleStatus -eq 'Unknown') { return 'Unknown' }
     if ($null -eq $RetirementDate)      { return 'None'    }
     $days = ([datetime]$RetirementDate - (Get-Date)).TotalDays
     if ($days -lt 0)  { return 'Retired'  }
@@ -145,6 +181,8 @@ if (-not $azAccount) {
     Write-Error "Not logged in to Azure CLI. Run 'az login' first, then re-run this script."
     exit 1
 }
+$originalSubscriptionId       = ($azAccount | ConvertFrom-Json).id
+$script:currentSubscriptionId = $originalSubscriptionId
 
 $rgExt = az extension list --query "[?name=='resource-graph']" -o json --only-show-errors 2>$null | ConvertFrom-Json
 if (-not $rgExt) {
@@ -169,49 +207,58 @@ if (-not $subs -or $subs.Count -eq 0) {
 $report         = [System.Collections.Generic.List[pscustomobject]]::new()
 $lifecycleCache = @{}   # keyed by account resource ID; one API call per account
 
-# ── Step 1: Discover Azure OpenAI accounts ────────────────────────────────────
-Write-Host "`n[1/4] Querying Azure OpenAI accounts via Resource Graph..."
-$oaiQuery    = "Resources | where type =~ 'microsoft.cognitiveservices/accounts' | where kind has 'OpenAI' or properties.kind has 'OpenAI' | project subscriptionId, resourceGroup, name, location, kind, id"
+# ── Step 1: Discover Microsoft Foundry and Azure OpenAI accounts ──────────────
+Write-Host "`n[1/4] Querying Microsoft Foundry and Azure OpenAI accounts via Resource Graph..."
+$oaiQuery    = "Resources | where type =~ 'microsoft.cognitiveservices/accounts' | where kind =~ 'AIServices' or kind =~ 'OpenAI' | project subscriptionId, resourceGroup, name, location, kind, id"
 $oaiAccounts = Invoke-GraphQuery -Query $oaiQuery -Subscriptions $subs
-Write-Host "      Found $($oaiAccounts.Count) Azure OpenAI account(s)."
+Write-Host "      Found $($oaiAccounts.Count) Microsoft Foundry/Azure OpenAI account(s)."
 
-# ── Step 2: List model deployments per OpenAI account (with lifecycle data) ───
-Write-Host "[2/4] Retrieving model deployments and lifecycle data from each Azure OpenAI account..."
+# ── Step 2: List model deployments per Foundry/OpenAI account ─────────────────
+Write-Host "[2/4] Retrieving model deployments and lifecycle data from each Microsoft Foundry/Azure OpenAI account..."
 $i = 0
 foreach ($acct in $oaiAccounts) {
     $i++
-    Write-Progress -Activity "Azure OpenAI Deployments" `
+    Write-Progress -Activity "Microsoft Foundry/Azure OpenAI Deployments" `
                    -Status  "$i / $($oaiAccounts.Count)  —  $($acct.name)  ($($acct.resourceGroup))" `
                    -PercentComplete ([math]::Round($i / [math]::Max($oaiAccounts.Count, 1) * 100))
 
     # Fetch lifecycle map once per account and cache it
     if (-not $lifecycleCache.ContainsKey($acct.id)) {
-        $lifecycleCache[$acct.id] = Get-ModelLifecycleMap -AccountId $acct.id
+        $lifecycleCache[$acct.id] = Get-ModelLifecycleMap -AccountId $acct.id -SubscriptionId $acct.subscriptionId
     }
     $lcMap = $lifecycleCache[$acct.id]
 
     $url  = "https://management.azure.com$($acct.id)/deployments?api-version=2024-10-01"
-    $resp = Invoke-AzRestJson -Url $url
+    $resp = Invoke-AzRestJson -Url $url -SubscriptionId $acct.subscriptionId
     if ($resp -and $resp.value) {
         foreach ($d in $resp.value) {
             $mName    = $d.properties.model.name
             $mVersion = $d.properties.model.version
-            $lcKey    = "$mName::$mVersion"
+            $publisher = if ($d.properties.model.format) { $d.properties.model.format } else { 'Unknown' }
+            $lcKey    = "$publisher::$mName::$mVersion"
             $lcInfo   = $lcMap[$lcKey]
 
-            # A model absent from the models list is treated as already retired
-            $lcStatus = if ($lcInfo) { $lcInfo.LifecycleStatus } else { 'Retired' }
+            # Absence from a successfully retrieved catalog indicates a retired model.
+            $lcStatus = if ($lcInfo) {
+                $lcInfo.LifecycleStatus
+            } elseif ($lcMap['__LookupSucceeded']) {
+                'Retired'
+            } else {
+                'Unknown'
+            }
             $retDate  = if ($lcInfo) { $lcInfo.RetirementDate  } else { $null     }
             $risk     = Get-RetirementRisk -LifecycleStatus $lcStatus -RetirementDate $retDate
             $daysLeft = if ($retDate) { [int]([datetime]$retDate - (Get-Date)).TotalDays } else { $null }
+            $source    = if ($acct.kind -eq 'AIServices') { 'MicrosoftFoundry' } else { 'AzureOpenAI' }
 
             $report.Add([pscustomobject]@{
-                Source              = 'AzureOpenAI'
+                Source              = $source
                 SubscriptionId      = $acct.subscriptionId
                 ResourceGroup       = $acct.resourceGroup
                 AccountName         = $acct.name
                 Location            = $acct.location
                 DeploymentName      = $d.name
+                ModelPublisher      = $publisher
                 ModelName           = $mName
                 ModelVersion        = $mVersion
                 SkuName             = $d.sku.name
@@ -227,9 +274,11 @@ foreach ($acct in $oaiAccounts) {
         }
     }
 }
-Write-Progress -Activity "Azure OpenAI Deployments" -Completed
+Write-Progress -Activity "Microsoft Foundry/Azure OpenAI Deployments" -Completed
 $oaiDeployCount = ($report | Where-Object Source -eq 'AzureOpenAI').Count
+$foundryDeployCount = ($report | Where-Object Source -eq 'MicrosoftFoundry').Count
 Write-Host "      Found $oaiDeployCount Azure OpenAI deployment(s)."
+Write-Host "      Found $foundryDeployCount Microsoft Foundry deployment(s)."
 
 # ── Step 3: Discover Azure ML online endpoints ────────────────────────────────
 Write-Host "[3/4] Querying Azure ML online endpoints via Resource Graph..."
@@ -246,7 +295,7 @@ foreach ($ep in $amlEndpoints) {
                    -Status  "$j / $($amlEndpoints.Count)  —  $($ep.name)  ($($ep.resourceGroup))" `
                    -PercentComplete ([math]::Round($j / [math]::Max($amlEndpoints.Count, 1) * 100))
     $url  = "https://management.azure.com$($ep.id)/deployments?api-version=2024-04-01"
-    $resp = Invoke-AzRestJson -Url $url
+    $resp = Invoke-AzRestJson -Url $url -SubscriptionId $ep.subscriptionId
     if ($resp -and $resp.value) {
         foreach ($d in $resp.value) {
             $report.Add([pscustomobject]@{
@@ -256,6 +305,7 @@ foreach ($ep in $amlEndpoints) {
                 AccountName         = $ep.name
                 Location            = $d.location
                 DeploymentName      = $d.name
+                ModelPublisher      = 'AzureML'
                 ModelName           = $d.properties.model
                 ModelVersion        = ''
                 SkuName             = $d.sku.name
@@ -290,15 +340,28 @@ if ($total -eq 0) {
     $highCnt     = ($report | Where-Object RetirementRisk -eq 'High').Count
     $mediumCnt   = ($report | Where-Object RetirementRisk -eq 'Medium').Count
     $lowCnt      = ($report | Where-Object RetirementRisk -eq 'Low').Count
+    $unknownCnt  = ($report | Where-Object RetirementRisk -eq 'Unknown').Count
+    $legacyCnt   = ($report | Where-Object LifecycleStatus -eq 'Legacy').Count
+    $deprecatingCnt = ($report | Where-Object LifecycleStatus -eq 'Deprecating').Count
 
     # ── Summary banner ────────────────────────────────────────────────────────
     Write-Host ""
     Write-Host "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
     Write-Host "  Scan complete."
     Write-Host "  Subscriptions scanned : $($subs.Count)"
+    Write-Host "  Foundry deploys       : $foundryDeployCount"
     Write-Host "  Azure OpenAI deploys  : $oaiDeployCount"
     Write-Host "  AML endpoint deploys  : $amlDeployCount"
     Write-Host "  Total deployments     : $total"
+    Write-Host ""
+    Write-Host "  Deployed model publishers:"
+    $report |
+        Group-Object ModelPublisher |
+        Sort-Object Name |
+        ForEach-Object {
+            $publisherName = if ([string]::IsNullOrWhiteSpace($_.Name)) { 'Unknown' } else { $_.Name }
+            Write-Host "    $publisherName : $($_.Count)"
+        }
     Write-Host ""
     Write-Host "  Retirement Risk Summary:"
     if ($retiredCnt  -gt 0) { Write-Host "    [RETIRED ]  $retiredCnt deployment(s) — model no longer available, immediate action required!" -ForegroundColor Red    }
@@ -306,8 +369,12 @@ if ($total -eq 0) {
     if ($highCnt     -gt 0) { Write-Host "    [HIGH    ]  $highCnt deployment(s) — retiring within 31-60 days"                               -ForegroundColor Yellow }
     if ($mediumCnt   -gt 0) { Write-Host "    [MEDIUM  ]  $mediumCnt deployment(s) — retiring within 61-90 days"                             -ForegroundColor Cyan   }
     if ($lowCnt      -gt 0) { Write-Host "    [LOW     ]  $lowCnt deployment(s) — retiring in more than 90 days"                             -ForegroundColor Green  }
-    if (($retiredCnt + $criticalCnt + $highCnt + $mediumCnt + $lowCnt) -eq 0) {
+    if ($unknownCnt  -gt 0) { Write-Host "    [UNKNOWN ]  $unknownCnt deployment(s) — lifecycle lookup unavailable; review required"        -ForegroundColor Yellow }
+    if (($retiredCnt + $criticalCnt + $highCnt + $mediumCnt + $lowCnt + $unknownCnt) -eq 0) {
         Write-Host "    No retirement risks detected." -ForegroundColor Green
+    }
+    if (($legacyCnt + $deprecatingCnt) -gt 0) {
+        Write-Host "    Lifecycle attention: $deprecatingCnt deprecating, $legacyCnt legacy deployment(s)." -ForegroundColor Yellow
     }
     Write-Host ""
     Write-Host "  Report saved to       : $resolvedPath"
@@ -320,13 +387,14 @@ if ($total -eq 0) {
         if ($null -eq $p) { 6 } else { $p }
     }, AccountName, DeploymentName
 
-    $cw = @{ Risk=10; Source=16; RG=20; Acct=22; Deploy=22; Model=22; Ver=14; RetDate=14; Days=7; State=13 }
-    $hdr = '{0} {1} {2} {3} {4} {5} {6} {7} {8} {9}' -f `
+    $cw = @{ Risk=10; Source=16; RG=20; Acct=22; Deploy=22; Publisher=16; Model=22; Ver=14; RetDate=14; Days=7; State=13 }
+    $hdr = '{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}' -f `
         'Risk'.PadRight($cw.Risk),
         'Source'.PadRight($cw.Source),
         'ResourceGroup'.PadRight($cw.RG),
         'AccountName'.PadRight($cw.Acct),
         'DeploymentName'.PadRight($cw.Deploy),
+        'Publisher'.PadRight($cw.Publisher),
         'ModelName'.PadRight($cw.Model),
         'Version'.PadRight($cw.Ver),
         'RetirementDate'.PadRight($cw.RetDate),
@@ -339,12 +407,13 @@ if ($total -eq 0) {
     foreach ($row in $sorted) {
         $color   = Get-RiskColor -Risk $row.RetirementRisk
         $daysStr = if ($null -ne $row.DaysUntilRetirement) { $row.DaysUntilRetirement.ToString() } else { 'N/A' }
-        $line = '{0} {1} {2} {3} {4} {5} {6} {7} {8} {9}' -f `
+        $line = '{0} {1} {2} {3} {4} {5} {6} {7} {8} {9} {10}' -f `
             (Truncate $row.RetirementRisk   $cw.Risk),
             (Truncate $row.Source           $cw.Source),
             (Truncate $row.ResourceGroup    $cw.RG),
             (Truncate $row.AccountName      $cw.Acct),
             (Truncate $row.DeploymentName   $cw.Deploy),
+            (Truncate $row.ModelPublisher   $cw.Publisher),
             (Truncate $row.ModelName        $cw.Model),
             (Truncate $row.ModelVersion     $cw.Ver),
             (Truncate $row.RetirementDate   $cw.RetDate),
@@ -354,3 +423,5 @@ if ($total -eq 0) {
     }
     Write-Host ""
 }
+
+[void](Set-AzSubscriptionContext -SubscriptionId $originalSubscriptionId)
