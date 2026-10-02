@@ -43,49 +43,59 @@ Report progress as you go through these phases.
 For every row you send to a tool, derive the Foundry account resource ID by taking
 the `ResourceId` value and trimming everything from `/deployments/` onward.
 
+> **Required MCP server:** this prompt uses the **Azure MCP Server**
+> (`com.microsoft/azure`, started via `dnx Azure.Mcp -- server start`). All tools
+> below — `model_switch_recommendations_get`, `model_catalog_list`,
+> `model_details_get`, `model_benchmark_subset_get`, `model_deprecation_info_get`
+> — are provided by it. No other MCP server is required.
+
 6. **At-risk rows (required migrations):** sort by `DaysUntilRetirement` ascending.
-   For each, call `model_switch_recommendations_get` with `foundryAccountResourceId`
-   and `modelDeploymentName` = `DeploymentName` (fall back to `modelName` +
-   `modelVersion`). Use `sortBy: "QualityIndex"`, `top: 3`.
+   For each, build a recommendation using this ladder and record which rung
+   produced it:
+   1. **Switch tool (primary).** Call `model_switch_recommendations_get` with
+      `foundryAccountResourceId` and `modelDeploymentName` = `DeploymentName` (fall
+      back to `modelName` + `modelVersion`), `sortBy: "QualityIndex"`, `top: 3`. If
+      it returns data, use it and set `Source` = `switch-tool`. If it returns no
+      data or errors, continue to the next rung (do not surface the error as a
+      failed row).
+   2. **Catalog successor / newer version.** Call `model_catalog_list` with
+      `publisherName` = `ModelPublisher` and `modelName` = the model family (e.g.
+      `gpt-chat` for `gpt-chat-latest`, `gpt-realtime` for `gpt-realtime-mini`),
+      and/or `model_details_get` on the deployed `ModelName`. Recommend the newest
+      version in the **same family** (higher version date on the same alias — e.g.
+      `gpt-chat-latest 2026-05-05` → `gpt-chat-latest 2026-08-06` — or a described
+      successor, e.g. `gpt-realtime-mini` → `gpt-realtime-2.1-mini`). Set `Source`
+      = `catalog`.
+   3. **Benchmark ranking (enrichment).** When there are multiple candidates, call
+      `model_benchmark_subset_get` with the candidate `modelName`+`modelVersion`
+      pairs and rank by `qualityIndex` (higher better) and `costIndex` (lower
+      better). Cite those indices as the "why"; set `Source` = `benchmark` when the
+      pick is chosen on these numbers.
+   4. **Deprecation guidance.** If the catalog shows no newer same-family version,
+      call `model_deprecation_info_get` and record its migration guidance and
+      `versionUpgradeOption`. Set `Source` = `deprecation-guidance`.
+   5. **None.** If nothing above yields a successor, state "No tool-backed
+      replacement — review manually" and still show the retirement date. Set
+      `Source` = `none`.
+   Never invent a successor model name: every recommendation must come from a tool
+   response (switch tool, catalog, benchmark, or deprecation guidance).
 
 7. **If there are NO at-risk rows**, the estate is healthy — say so explicitly,
    then still provide **proactive** upgrade options: for each distinct
-   `Source` = `MicrosoftFoundry`/`AzureOpenAI` deployment, call
-   `model_switch_recommendations_get` (same params); if it fails or returns
-   nothing, apply the same fallback ladder in step 8 (catalog newer version →
-   deprecation guidance). Surface any candidate that improves QualityIndex or
-   CostIndex, or a newer same-family catalog version. Clearly label these
-   **"proactive, not required."** Skip models where no rung yields a successor.
-
-8. **Fallback ladder when `model_switch_recommendations_get` fails (500) or
-   returns no data.** This is expected for benchmark-less models — realtime/audio
-   (`gpt-realtime*`, `gpt-audio*`), rolling aliases (`*-latest`), and some preview
-   SKUs. Do NOT abort the batch. For each such row, walk this ladder in order and
-   record which rung produced the answer:
-   1. **Catalog newer version (preferred authoritative fallback).** Call
-      `model_catalog_list` with `publisherName` = `ModelPublisher` and
-      `modelName` = the model family (e.g. `gpt-realtime` for `gpt-realtime-mini`),
-      and/or `model_details_get` on the deployed `ModelName`. If the catalog
-      exposes a newer version in the **same family** (higher version date, or an
-      explicitly described successor — e.g. `gpt-realtime-mini` →
-      `gpt-realtime-2.1-mini`), recommend that. Set `Source` =
-      `catalog-newer-version` and cite the catalog version/date as the "why".
-   2. **Deprecation guidance.** If the catalog shows no newer same-family version,
-      call `model_deprecation_info_get` and record its migration guidance and
-      `versionUpgradeOption`. Set `Source` = `deprecation-guidance`.
-   3. **None.** If neither yields a successor, state "No tool-backed replacement —
-      review manually" and still show the retirement date. Set `Source` = `none`.
-   Never invent a successor model name: every recommendation must come from a tool
-   response (benchmark, catalog, or deprecation guidance).
+   `Source` = `MicrosoftFoundry`/`AzureOpenAI` deployment, apply the same ladder
+   from step 6 (switch tool → catalog newer version → benchmark rank → deprecation
+   guidance). Surface any candidate that is a newer same-family version or improves
+   `qualityIndex`/`costIndex`. Clearly label these **"proactive, not required."**
+   Skip models where no rung yields a successor.
 
 ## Phase 4 — Report
 
-9. Output one consolidated Markdown table grouped by section (Required migrations,
+8. Output one consolidated Markdown table grouped by section (Required migrations,
    then Proactive upgrades): Risk | Subscription | Account | Deployment |
    Current model+version | RetirementDate | Days left | Recommendation | Source
-   (`benchmark` / `catalog-newer-version` / `deprecation-guidance` / `none`) |
+   (`switch-tool` / `catalog` / `benchmark` / `deprecation-guidance` / `none`) |
    Why (quality/cost index, or catalog version/date, or guidance text).
-10. List any rows where every rung of the fallback ladder failed, for manual review.
+9. List any rows where no rung of the ladder yielded a successor, for manual review.
 
 ## Constraints
 
